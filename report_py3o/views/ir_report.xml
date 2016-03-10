@@ -10,7 +10,7 @@
             <field name="arch" type="xml">
 
                 <xpath expr="//page[@name='security']" position="before">
-                    <page string="LibreOffice template"
+                    <page string="LibreOffice template" name="lo_template"
                         attrs="{'invisible': [('report_type', '!=', 'py3o')]}">
 
                         <group>
