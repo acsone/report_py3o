@@ -64,8 +64,8 @@ msgstr "ID"
 
 #. module: report_py3o
 #: help:ir.actions.report.xml,py3o_template_fallback:0
-msgid "If the user does not provide a template this will be used it should be a relative path to root of YOUR module"
-msgstr "If the user does not provide a template this will be used it should be a relative path to root of YOUR module"
+msgid "If the user does not provide a template this will be used it should be a relative path to root of YOUR module or an absolute path on your server."
+msgstr "Si l'utilisateur ne fournit pas de template ce champ peut être utilisé pour spécifier un chemin vers un fichier. Ce chemin doit être relatif au module spécifié ou absolu vers un fichier sur le serveur."
 
 #. module: report_py3o
 #: field:py3o.fusion.filetype,write_uid:0 field:py3o.server,write_uid:0
