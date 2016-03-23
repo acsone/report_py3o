@@ -1,5 +1,10 @@
 # -*- encoding: utf-8 -*-
+import ast
 from cStringIO import StringIO
+import collections
+import datetime
+from functools import partial
+from itertools import imap
 import json
 import pkg_resources
 import os
@@ -7,8 +12,11 @@ import sys
 from base64 import b64decode
 import requests
 from tempfile import NamedTemporaryFile
+
 from openerp import _
 from openerp import exceptions
+from openerp.osv.orm import browse_record
+from openerp.osv.orm import browse_record_list
 from openerp.report.report_sxw import report_sxw, rml_parse
 from openerp import registry
 from openerp.exceptions import ValidationError
@@ -16,12 +24,126 @@ from openerp.exceptions import ValidationError
 from py3o.template.helpers import Py3oConvertor
 from py3o.template import Template
 
+from py3o.types import Py3oTypeConfig
+from py3o.types import Py3oInteger
+from py3o.types import Py3oFloat
+from py3o.types import Py3oDate
+from py3o.types import Py3oTime
+from py3o.types import Py3oDatetime
+from py3o.types.json import Py3oJSONEncoder
+from py3o.types.json import Py3oJSONDecoder
 
 _extender_functions = {}
 
 
 class TemplateNotFound(Exception):
     pass
+
+
+class OpenERPToPy3o(collections.Mapping, collections.Sequence):
+
+    openerp_py3o_types = {
+        'integer': Py3oInteger,
+        'float': Py3oFloat,
+        'date': partial(Py3oDate.strptime, format='%Y-%m-%d'),
+        'time': partial(Py3oTime.strptime, format='%H:%M:%S'),
+        'datetime': partial(Py3oDatetime.strptime, format='%Y-%m-%d %H:%M:%S'),
+    }
+
+    default_py3o_types = {
+        int: Py3oInteger,
+        float: Py3oFloat,
+        datetime.date: Py3oDate,
+        datetime.time: Py3oTime,
+        datetime.datetime: Py3oDatetime,
+    }
+
+    @classmethod
+    def from_config(cls, config):
+
+        oetypes = {
+            'integer': config.integer,
+            'float': config.float,
+            'date': partial(config.date.strptime, format='%Y-%m-%d'),
+            'time': partial(config.time.strptime, format='%H:%M:%S'),
+            'datetime': partial(
+                config.datetime.strptime, format='%Y-%m-%d %H:%M:%S'
+            ),
+        }
+
+        deftypes = {
+            int: config.integer,
+            float: config.float,
+            datetime.date: config.date,
+            datetime.time: config.time,
+            datetime.datetime: config.datetime
+        }
+
+        nmspc = {
+            'openerp_py3o_types': oetypes, 'default_py3o_types': deftypes
+        }
+        return type('TEST'+cls.__name__, (cls,), nmspc)
+
+    def __init__(self, cr, uid, value, fields_get=None):
+        self._cr = cr
+        self._uid = uid
+        self._value = value
+        self._fields_get = fields_get
+
+    def __getitem__(self, item):
+        return self._to_py3o(item, self._value[item])
+
+    def __getattr__(self, attr):
+        return self._to_py3o(attr, getattr(self._value, attr))
+
+    def _to_py3o(self, key, val):
+        cr, uid, fields_get = self._cr, self._uid, self._fields_get
+        field = fields_get.get(key, None) if fields_get else None
+
+        # Order is important for v8 : all browse_record are browse_record_list
+        if isinstance(val, browse_record):
+            if field is None:
+                field = {}
+                if fields_get is not None:
+                    fields_get[key] = field
+            if 'id' not in field:
+                field.update(val._model.fields_get(cr, uid))
+            res = type(self)(cr, uid, val, field)
+
+        elif isinstance(val, browse_record_list):
+            res = [self._to_py3o(key, v) for v in val]
+
+        elif isinstance(val, (dict, list, tuple)):
+            # Lose the fields_get context
+            res = type(self)(cr, uid, val)
+
+        else:
+            ftype = field.get('type', None) if field else None
+            py3o_type = self.openerp_py3o_types.get(ftype) if ftype else None
+            if py3o_type is None:
+                py3o_type = self.default_py3o_types.get(type(val))
+            res = py3o_type(val) if py3o_type is not None else val
+
+        return res
+
+    def __len__(self):
+        return len(self._value)
+
+    def __iter__(self):
+        """Return an iterator for the wrapped value.
+
+        If the value is a browse_record, return self inside an iterable.
+        If it is a list or a browse_record_list, return an iterator that
+
+        This is the desired behavior for a dictionary.
+        """
+
+        if isinstance(self._value, browse_record):
+            return iter((self,))
+        elif isinstance(self._value, (list, browse_record_list)):
+            return imap(self._to_py3o, imap(enumerate, self._value))
+        else:
+            return iter(self._value)
 
 
 def py3o_report_extender(report_name):
@@ -107,6 +229,39 @@ class Py3oParser(report_sxw):
 
         return tmpl_data
 
+    def get_default_type_config(self, cr, uid, pool=None, context=None):
+
+        if pool is None:
+            pool = registry(cr.dbname)
+        lang_osv = pool['res.lang']
+
+        if context and 'lang' in context:
+            lang = context['lang']
+        else:
+            lang = pool['res.users'].browse(cr, uid, uid, context=context).lang
+
+        lang_domain = [('code', '=', lang)]
+        lang_id = lang_osv.search(cr, uid, lang_domain, context=context)
+        if not lang_id:
+            return None
+
+        lang_rec = lang_osv.browse(cr, uid, lang_id, context=context)
+        res = {
+            'date_format': lang_rec.date_format,
+            'time_format': lang_rec.time_format,
+            'digit_separator': lang_rec.thousands_sep,
+            'decimal_separator': lang_rec.decimal_point,
+        }
+
+        try:
+            grouping = ast.literal_eval(lang_rec.grouping)
+            if grouping:
+                res['digit_format'] = grouping[0]
+        except (SyntaxError, ValueError):
+            pass
+
+        return res
+
     def create_single_pdf(self, cr, uid, ids, data, report_xml, context=None):
         """ Overide this function to generate our py3o report
         """
@@ -152,9 +307,17 @@ class Py3oParser(report_sxw):
 
         filetype = report_xml.py3o_fusion_filetype
 
-        datadict = parser_instance.localcontext
+        type_config_defaults = self.get_default_type_config(
+            cr, uid, pool=pool, context=context
+        )
+        type_config = Py3oTypeConfig.from_odf_file(
+            in_stream, defaults=type_config_defaults
+        )
 
-        parsed_datadict = data_struct.render(datadict)
+        datadict = parser_instance.localcontext
+        py3o_translator = OpenERPToPy3o.from_config(type_config)
+        translator_datadict = py3o_translator(cr, uid, datadict)
+        parsed_datadict = data_struct.render(translator_datadict)
 
         fusion_server_obj = pool.get('py3o.server')
         fusion_server_ids = fusion_server_obj.search(
@@ -176,13 +339,14 @@ class Py3oParser(report_sxw):
             fusion_server = fusion_server_obj.browse(
                 cr, uid, fusion_server_id, context=context
             )
-            in_stream.seek(0)
+
+            # Update the template metadata with the used configuration
             files = {
-                'tmpl_file': in_stream,
+                'tmpl_file': type_config.apply_to_odf_file(in_stream)
             }
             fields = {
                 "targetformat": filetype.fusion_ext,
-                "datadict": json.dumps(parsed_datadict),
+                "datadict": Py3oJSONEncoder().encode(parsed_datadict),
                 "image_mapping": "{}",
             }
             r = requests.post(fusion_server.url, data=fields, files=files)
